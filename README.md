@@ -68,7 +68,7 @@ Debezium CDC ──► Kafka Topics ──► Spark Structured Streaming
 
 ```bash
 # 1. Clone the repo
-git clone https://github.com/YOUR_USERNAME/realtime-lakehouse.git
+git clone https://github.com/TouguiOmar/realtime-lakehouse.git
 cd realtime-lakehouse
 
 # 2. Start the full stack
