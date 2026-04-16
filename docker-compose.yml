@@ -1,0 +1,261 @@
+# ─────────────────────────────────────────────
+#  Real-Time Lakehouse — Local Dev Stack
+#  Services: Postgres · Zookeeper · Kafka
+#           Schema Registry · Kafka Connect (Debezium)
+#           MinIO · Spark Master · Spark Worker
+# ─────────────────────────────────────────────
+
+networks:
+  lakehouse:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  minio_data:
+  spark_logs:
+  kafka_data:
+
+services:
+
+  # ── 1. Source database ────────────────────────────────────────────
+  postgres:
+    image: postgres:15
+    container_name: lakehouse-postgres
+    networks: [lakehouse]
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: secret
+      POSTGRES_DB: ecommerce
+    command: >
+      postgres
+        -c wal_level=logical
+        -c max_replication_slots=4
+        -c max_wal_senders=4
+        -c wal_keep_size=256
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── 2. Zookeeper (Kafka dependency) ──────────────────────────────
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: lakehouse-zookeeper
+    networks: [lakehouse]
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    healthcheck:
+      test: ["CMD-SHELL", "echo ruok | timeout 2 /bin/bash -c 'cat < /dev/null > /dev/tcp/localhost/2181' && echo ok || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
+  # ── 3. Kafka broker ───────────────────────────────────────────────
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: lakehouse-kafka
+    networks: [lakehouse]
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_LOG_RETENTION_HOURS: 168        # keep 7 days of CDC events
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    ports:
+      - "29092:29092"                        # host access (Kafka clients outside Docker)
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-broker-api-versions --bootstrap-server localhost:9092"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+
+  # ── 4. Schema Registry ────────────────────────────────────────────
+  schema-registry:
+    image: confluentinc/cp-schema-registry:7.5.0
+    container_name: lakehouse-schema-registry
+    networks: [lakehouse]
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      SCHEMA_REGISTRY_HOST_NAME: schema-registry
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: kafka:9092
+      SCHEMA_REGISTRY_LISTENERS: http://0.0.0.0:8081
+    ports:
+      - "8081:8081"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8081/subjects || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+
+  # ── 5. Kafka Connect + Debezium ───────────────────────────────────
+  kafka-connect:
+    image: debezium/connect:2.4
+    container_name: lakehouse-connect
+    networks: [lakehouse]
+    depends_on:
+      kafka:
+        condition: service_healthy
+      schema-registry:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    environment:
+      BOOTSTRAP_SERVERS: kafka:9092
+      GROUP_ID: lakehouse-connect
+      CONFIG_STORAGE_TOPIC: connect-configs
+      OFFSET_STORAGE_TOPIC: connect-offsets
+      STATUS_STORAGE_TOPIC: connect-status
+      CONFIG_STORAGE_REPLICATION_FACTOR: 1
+      OFFSET_STORAGE_REPLICATION_FACTOR: 1
+      STATUS_STORAGE_REPLICATION_FACTOR: 1
+      # JSON converters (built-in — no extra jars needed)
+      KEY_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      VALUE_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      KEY_CONVERTER_SCHEMAS_ENABLE: "false"
+      VALUE_CONVERTER_SCHEMAS_ENABLE: "false"
+      CONNECT_PLUGIN_PATH: /kafka/connect,/usr/share/confluent-hub-components
+    ports:
+      - "8083:8083"                          # REST API for connector management
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8083/connectors || exit 1"]
+      interval: 20s
+      timeout: 10s
+      retries: 8
+
+  # ── 6. MinIO (S3-compatible object store) ─────────────────────────
+  minio:
+    image: minio/minio:latest
+    container_name: lakehouse-minio
+    networks: [lakehouse]
+    volumes:
+      - minio_data:/data
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"                          # S3 API
+      - "9001:9001"                          # Web console
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9000/minio/health/live || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── 7. MinIO bucket initializer (runs once, then exits) ───────────
+  minio-init:
+    image: minio/mc:latest
+    container_name: lakehouse-minio-init
+    networks: [lakehouse]
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+        mc alias set local http://minio:9000 minioadmin minioadmin;
+        mc mb --ignore-existing local/lakehouse;
+        mc mb --ignore-existing local/lakehouse-checkpoints;
+        echo 'Buckets created.';
+      "
+    restart: "no"
+
+  # ── 8. Spark Master ───────────────────────────────────────────────
+  spark-master:
+    image: apache/spark:3.5.1
+    container_name: lakehouse-spark-master
+    networks: [lakehouse]
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+    volumes:
+      - ./spark:/opt/spark-apps              # your Python job files
+      - spark_logs:/opt/spark/logs
+    ports:
+      - "8080:8080"                          # Spark Master Web UI
+      - "7077:7077"                          # Spark Master port (for spark-submit)
+    command: >
+      /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master
+      --host spark-master --port 7077 --webui-port 8080
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8080 || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+
+  # ── 9. Spark Worker ───────────────────────────────────────────────
+  spark-worker:
+    image: apache/spark:3.5.1
+    container_name: lakehouse-spark-worker
+    networks: [lakehouse]
+    depends_on:
+      spark-master:
+        condition: service_healthy
+    environment:
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+    volumes:
+      - ./spark:/opt/spark-apps
+      - spark_logs:/opt/spark/logs
+    ports:
+      - "8082:8081"                          # Worker Web UI (mapped to 8082 — 8081 taken by Schema Registry)
+    command: >
+      /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker
+      --webui-port 8081 spark://spark-master:7077
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8081 || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+
+  # ── 10. Airflow (single-node, LocalExecutor) ──────────────────────
+  airflow:
+    image: apache/airflow:2.8.0
+    container_name: lakehouse-airflow
+    networks: [lakehouse]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://postgres:secret@postgres/ecommerce
+      AIRFLOW__CORE__FERNET_KEY: "ZmDfcTF7_60GrrY167zsiPd67pEvs0aGOv2oasOM1Pg="
+      AIRFLOW__WEBSERVER__SECRET_KEY: "d3LqM8vNpX2kR5tY9wZaQcJhBgEuFoIs"
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      _AIRFLOW_DB_UPGRADE: "true"
+      _AIRFLOW_WWW_USER_CREATE: "true"
+      _AIRFLOW_WWW_USER_USERNAME: admin
+      _AIRFLOW_WWW_USER_PASSWORD: admin
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+    ports:
+      - "8085:8080"                          # Airflow UI (mapped to 8085 — 8080 taken by Spark)
+    command: standalone
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8080/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+    restart: on-failure
