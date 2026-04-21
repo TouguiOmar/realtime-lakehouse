@@ -24,7 +24,8 @@ services:
     networks: [lakehouse]
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - ./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/01-init.sql
+      - ./postgres/grants.sql:/docker-entrypoint-initdb.d/02-grants.sql
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: secret
@@ -141,6 +142,8 @@ services:
       interval: 20s
       timeout: 10s
       retries: 8
+    volumes:
+      - ./debezium:/debezium
 
   # ── 6. MinIO (S3-compatible object store) ─────────────────────────
   minio:

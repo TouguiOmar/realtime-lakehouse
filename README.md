@@ -68,7 +68,7 @@ Debezium CDC ──► Kafka Topics ──► Spark Structured Streaming
 
 ```bash
 # 1. Clone the repo
-git clone https://github.com/TouguiOmar/realtime-lakehouse.git
+git clone https://github.com/YOUR_USERNAME/realtime-lakehouse.git
 cd realtime-lakehouse
 
 # 2. Start the full stack
@@ -78,17 +78,32 @@ docker compose up -d
 docker compose ps
 
 # 4. Register the Debezium connector
-curl -X POST http://localhost:8083/connectors \
-  -H "Content-Type: application/json" \
-  -d @debezium/register-connector.json
+cmd /c "docker exec lakehouse-connect curl -X POST http://localhost:8083/connectors -H ""Content-Type: application/json"" -d @/debezium/register-connector.json"
 
-# 5. Verify CDC events are flowing
-docker exec -it lakehouse-kafka \
-  kafka-console-consumer \
+
+# 5. Seed some data
+docker exec lakehouse-postgres psql -U postgres -d ecommerce \
+  -c "INSERT INTO orders (customer_id, status, total_usd) VALUES (1, 'pending', 99.99), (2, 'completed', 149.50);"
+
+# 6. Verify CDC events are flowing
+docker exec lakehouse-kafka kafka-console-consumer \
   --bootstrap-server localhost:9092 \
   --topic cdc.public.orders \
-  --from-beginning
+  --from-beginning --max-messages 5
 ```
+
+---
+
+## Current Progress
+
+| Phase | Status | Description |
+|---|---|---|
+| 1 · Docker setup | ✅ Done | Full 9-service stack running |
+| 2 · Postgres + CDC | ✅ Done | Schema, replication slot, publication |
+| 3 · Kafka + Debezium | ✅ Done | CDC events flowing, decimal fix applied |
+| 4 · Spark → Bronze | 🔜 Next | Structured Streaming to Iceberg |
+| 5 · dbt Silver/Gold | ⏳ Pending | MERGE upserts + aggregates |
+| 6 · Orchestrate + quality | ⏳ Pending | Airflow DAGs + Great Expectations |
 
 ---
 
@@ -111,18 +126,19 @@ docker exec -it lakehouse-kafka \
 realtime-lakehouse/
 ├── docker-compose.yml          # Full local stack definition
 ├── postgres/
-│   └── init.sql                # Source schema + Debezium user setup
+│   ├── init.sql                # Source schema + Debezium user setup
+│   └── grants.sql              # Debezium permissions + publication
 ├── debezium/
 │   └── register-connector.json # Debezium Postgres connector config
 ├── spark/
-│   └── bronze_writer.py        # Spark Structured Streaming job
+│   └── bronze_writer.py        # Spark Structured Streaming job (coming)
 ├── dbt/
 │   └── models/
-│       ├── silver/             # Dedup + upsert models
-│       └── gold/               # Business aggregate models
+│       ├── silver/             # Dedup + upsert models (coming)
+│       └── gold/               # Business aggregate models (coming)
 ├── airflow/
-│   └── dags/                   # Pipeline orchestration DAGs
-└── great_expectations/         # Data quality checkpoints
+│   └── dags/                   # Pipeline orchestration DAGs (coming)
+└── great_expectations/         # Data quality checkpoints (coming)
 ```
 
 ---
@@ -140,6 +156,37 @@ Business-ready aggregates. Daily revenue, order counts by status, customer lifet
 
 ---
 
+## CDC Event Structure
+
+Every Kafka message from Debezium follows this envelope:
+
+```json
+{
+  "op": "c",
+  "before": null,
+  "after": {
+    "id": 1,
+    "customer_id": 4,
+    "status": "pending",
+    "total_usd": "75.00",
+    "created_at": "2026-04-21T14:49:11.903714Z",
+    "updated_at": "2026-04-21T14:49:11.903714Z"
+  },
+  "source": {
+    "connector": "postgresql",
+    "db": "ecommerce",
+    "table": "orders",
+    "lsn": 29048488,
+    "ts_ms": 1776782951904
+  },
+  "ts_ms": 1776782952099
+}
+```
+
+Op types: `r` = snapshot, `c` = insert, `u` = update, `d` = delete
+
+---
+
 ## Key Engineering Decisions
 
 **Why Iceberg over Delta Lake?**
@@ -151,16 +198,21 @@ The Debezium Docker image does not bundle the Confluent Avro serializer. For a l
 **Why `REPLICA IDENTITY FULL` on Postgres tables?**
 By default, Postgres only includes the primary key in the WAL `before` image on updates. `REPLICA IDENTITY FULL` captures the entire old row, which is required for the Silver MERGE to correctly handle updates and compute change deltas.
 
+**Why `decimal.handling.mode=string` in Debezium?**
+By default Debezium encodes `NUMERIC` columns as base64 binary (`"Jw8="`). Setting `string` mode emits human-readable decimals (`"99.99"`) which are easier to parse in Spark and dbt without extra decoding logic.
+
 ---
 
 ## What's Next
 
-- [ ] Add OpenLineage for data lineage tracking
-- [ ] Add Trino query layer with sample analytical queries
-- [ ] Add Great Expectations checkpoints to Airflow DAG
-- [ ] Add Iceberg compaction + snapshot expiry maintenance tasks
-- [ ] Add Grafana dashboard for pipeline observability
-- [ ] Write Spark Bronze writer with full CDC op handling
+- [ ] Spark Bronze writer — Structured Streaming job writing CDC events to Iceberg
+- [ ] dbt Silver model — deduplication + MERGE upserts
+- [ ] dbt Gold model — daily revenue and order aggregates
+- [ ] Airflow DAG — orchestrate dbt runs every 15 minutes
+- [ ] Great Expectations — data quality checkpoints on Silver
+- [ ] Iceberg compaction + snapshot expiry maintenance tasks
+- [ ] Trino query layer with sample analytical queries
+- [ ] OpenLineage for data lineage tracking
 
 ---
 
