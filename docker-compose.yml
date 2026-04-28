@@ -196,6 +196,7 @@ services:
     volumes:
       - ./spark:/opt/spark-apps              # your Python job files
       - spark_logs:/opt/spark/logs
+      - ./spark/ivy2:/home/spark/.ivy2   # ← add this line
     ports:
       - "8080:8080"                          # Spark Master Web UI
       - "7077:7077"                          # Spark Master port (for spark-submit)
@@ -222,6 +223,7 @@ services:
     volumes:
       - ./spark:/opt/spark-apps
       - spark_logs:/opt/spark/logs
+      - ./spark/ivy2:/home/spark/.ivy2   # ← add this line
     ports:
       - "8082:8081"                          # Worker Web UI (mapped to 8082 — 8081 taken by Schema Registry)
     command: >

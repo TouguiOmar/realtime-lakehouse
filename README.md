@@ -80,7 +80,6 @@ docker compose ps
 # 4. Register the Debezium connector
 cmd /c "docker exec lakehouse-connect curl -X POST http://localhost:8083/connectors -H ""Content-Type: application/json"" -d @/debezium/register-connector.json"
 
-
 # 5. Seed some data
 docker exec lakehouse-postgres psql -U postgres -d ecommerce \
   -c "INSERT INTO orders (customer_id, status, total_usd) VALUES (1, 'pending', 99.99), (2, 'completed', 149.50);"
@@ -90,6 +89,12 @@ docker exec lakehouse-kafka kafka-console-consumer \
   --bootstrap-server localhost:9092 \
   --topic cdc.public.orders \
   --from-beginning --max-messages 5
+
+# 7. Start the Bronze Spark writer
+docker exec lakehouse-spark-master /opt/spark/bin/spark-submit \
+  --master spark://spark-master:7077 \
+  --packages org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.5.0,org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1,org.apache.hadoop:hadoop-aws:3.3.4,com.amazonaws:aws-java-sdk-bundle:1.12.262 \
+  /opt/spark-apps/bronze_writer.py
 ```
 
 ---
@@ -101,7 +106,7 @@ docker exec lakehouse-kafka kafka-console-consumer \
 | 1 · Docker setup | ✅ Done | Full 9-service stack running |
 | 2 · Postgres + CDC | ✅ Done | Schema, replication slot, publication |
 | 3 · Kafka + Debezium | ✅ Done | CDC events flowing, decimal fix applied |
-| 4 · Spark → Bronze | 🔜 Next | Structured Streaming to Iceberg |
+| 4 · Spark → Bronze | 🔧 In Progress | Writer works, verifying data in Iceberg |
 | 5 · dbt Silver/Gold | ⏳ Pending | MERGE upserts + aggregates |
 | 6 · Orchestrate + quality | ⏳ Pending | Airflow DAGs + Great Expectations |
 
@@ -131,7 +136,8 @@ realtime-lakehouse/
 ├── debezium/
 │   └── register-connector.json # Debezium Postgres connector config
 ├── spark/
-│   └── bronze_writer.py        # Spark Structured Streaming job (coming)
+│   ├── bronze_writer.py        # Spark Structured Streaming → Iceberg Bronze
+│   └── ivy2/                   # Cached Spark/Ivy jars (persists across restarts)
 ├── dbt/
 │   └── models/
 │       ├── silver/             # Dedup + upsert models (coming)
@@ -146,7 +152,7 @@ realtime-lakehouse/
 ## Medallion Layers
 
 ### Bronze
-Raw CDC events stored as-is. Every `INSERT`, `UPDATE`, and `DELETE` is preserved with the full `before`/`after` payload and operation type (`op`). Partitioned by ingestion day. Enables full audit trail and replay.
+Raw CDC events stored as-is. Every `INSERT`, `UPDATE`, and `DELETE` is preserved with the full `before`/`after` payload and operation type (`op`). Enables full audit trail and replay.
 
 ### Silver
 Deduplicated, upserted current state of each entity. Handles all four CDC op types (`r`, `c`, `u`, `d`). Uses Iceberg `MERGE INTO` for exactly-once upsert semantics. Soft-deletes rows where `op = 'd'` using an `is_deleted` flag.
@@ -187,6 +193,23 @@ Op types: `r` = snapshot, `c` = insert, `u` = update, `d` = delete
 
 ---
 
+## Known Issues & Next Steps
+
+### 🔧 In Progress
+- Spark worker consumes all cores when `bronze_orders_writer` is running, blocking ad-hoc queries. Fix: configure `spark.cores.max` to limit the streaming job to fewer cores, leaving headroom for other applications.
+
+### ⏳ Up Next
+- [ ] Fix Spark resource allocation — limit bronze writer to 2 cores
+- [ ] Verify Bronze data landed in Iceberg via spark-sql
+- [ ] dbt Silver model — deduplication + MERGE upserts
+- [ ] dbt Gold model — daily revenue and order aggregates
+- [ ] Airflow DAG — orchestrate dbt runs every 15 minutes
+- [ ] Great Expectations — data quality checkpoints on Silver
+- [ ] Iceberg compaction + snapshot expiry maintenance tasks
+- [ ] Trino query layer with sample analytical queries
+
+---
+
 ## Key Engineering Decisions
 
 **Why Iceberg over Delta Lake?**
@@ -200,19 +223,6 @@ By default, Postgres only includes the primary key in the WAL `before` image on 
 
 **Why `decimal.handling.mode=string` in Debezium?**
 By default Debezium encodes `NUMERIC` columns as base64 binary (`"Jw8="`). Setting `string` mode emits human-readable decimals (`"99.99"`) which are easier to parse in Spark and dbt without extra decoding logic.
-
----
-
-## What's Next
-
-- [ ] Spark Bronze writer — Structured Streaming job writing CDC events to Iceberg
-- [ ] dbt Silver model — deduplication + MERGE upserts
-- [ ] dbt Gold model — daily revenue and order aggregates
-- [ ] Airflow DAG — orchestrate dbt runs every 15 minutes
-- [ ] Great Expectations — data quality checkpoints on Silver
-- [ ] Iceberg compaction + snapshot expiry maintenance tasks
-- [ ] Trino query layer with sample analytical queries
-- [ ] OpenLineage for data lineage tracking
 
 ---
 
