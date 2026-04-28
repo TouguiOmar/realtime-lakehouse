@@ -4,3 +4,4 @@ __pycache__/
 postgres/
 *.log
 airflow/logs/
+spark/ivy2/
