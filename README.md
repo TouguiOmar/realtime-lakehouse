@@ -32,7 +32,7 @@ Debezium CDC ──► Kafka Topics ──► Spark Structured Streaming
 3. **Spark Structured Streaming** (`bronze_writer.py`) consumes Kafka topics and writes the raw CDC envelope to the **Bronze** Iceberg layer
 4. **Spark** (`silver_writer.py`) reads Bronze, deduplicates events using `ROW_NUMBER()` on `ts_ms`, and merges into **Silver** using Iceberg `MERGE INTO`
 5. **Spark** (`gold_writer.py`) aggregates Silver into 3 business-ready **Gold** tables
-6. **Airflow** orchestrates Silver and Gold runs on a schedule
+6. **Airflow** orchestrates Silver and Gold runs every 15 minutes
 
 ---
 
@@ -66,37 +66,53 @@ Debezium CDC ──► Kafka Topics ──► Spark Structured Streaming
 git clone https://github.com/YOUR_USERNAME/realtime-lakehouse.git
 cd realtime-lakehouse
 
-# 2. Start the full stack
-docker compose up -d
+# 2. Set up environment variables
+cp .env.example .env   # fill in your values
 
-# 3. Wait for all services to be healthy (~2 min)
-docker compose ps
+# 3a. Windows — start everything in one command
+.\start.ps1            # opens Bronze writer in Terminal 2 automatically
 
-# 4. Register the Debezium connector
-cmd /c "docker exec lakehouse-connect curl -X POST http://localhost:8083/connectors -H ""Content-Type: application/json"" -d @/debezium/register-connector.json"
+# 3b. Linux / Mac
+make demo
 
-# 5. Seed some data
-docker exec lakehouse-postgres psql -U postgres -d ecommerce \
-  -c "INSERT INTO orders (customer_id, status, total_usd) VALUES (1, 'pending', 99.99), (2, 'completed', 149.50), (3, 'pending', 49.00);"
+# 4. Run Silver + Gold transforms
+.\run_silver.ps1       # Windows
+.\run_gold.ps1
 
-# 6. Start the Bronze Spark streaming writer (Terminal 1 — keep running)
-docker exec lakehouse-spark-master /opt/spark/bin/spark-submit \
-  --master spark://spark-master:7077 \
-  --conf spark.cores.max=2 \
-  --packages org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.5.0,org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1,org.apache.hadoop:hadoop-aws:3.3.4,com.amazonaws:aws-java-sdk-bundle:1.12.262 \
-  /opt/spark-apps/bronze_writer.py
+# or
+make silver            # Linux / Mac
+make gold
+```
 
-# 7. Run Silver MERGE (Terminal 2)
-docker exec lakehouse-spark-master /opt/spark/bin/spark-submit \
-  --master local[2] \
-  --packages org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.5.0,org.apache.hadoop:hadoop-aws:3.3.4,com.amazonaws:aws-java-sdk-bundle:1.12.262 \
-  /opt/spark-apps/silver_writer.py
+---
 
-# 8. Run Gold aggregations
-docker exec lakehouse-spark-master /opt/spark/bin/spark-submit \
-  --master local[2] \
-  --packages org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.5.0,org.apache.hadoop:hadoop-aws:3.3.4,com.amazonaws:aws-java-sdk-bundle:1.12.262 \
-  /opt/spark-apps/gold_writer.py
+## All Commands
+
+### Windows (PowerShell)
+
+| Script | Description |
+|---|---|
+| `.\start.ps1` | Start full stack + register Debezium + seed data + launch Bronze writer |
+| `.\run_silver.ps1` | Run Silver MERGE writer |
+| `.\run_gold.ps1` | Run Gold aggregations |
+
+### Linux / Mac (Make)
+
+```bash
+make help         # show all available commands
+make up           # start the stack
+make down         # stop and wipe volumes
+make restart      # full restart
+make register     # register Debezium connector
+make seed         # insert sample data
+make bronze       # start Bronze streaming writer (blocking)
+make silver       # run Silver MERGE
+make gold         # run Gold aggregations
+make pipeline     # run Silver then Gold in sequence
+make demo         # full end-to-end demo
+make status       # show service health
+make verify-cdc   # consume 5 Kafka CDC events
+make connector-status  # check Debezium connector health
 ```
 
 ---
@@ -110,7 +126,7 @@ docker exec lakehouse-spark-master /opt/spark/bin/spark-submit \
 | 3 · Kafka + Debezium | ✅ Done | CDC events flowing, decimal fix applied |
 | 4 · Spark → Bronze | ✅ Done | Streaming CDC events landing in Iceberg |
 | 5 · Silver + Gold | ✅ Done | MERGE upserts + 3 Gold aggregates |
-| 6 · Airflow orchestration | 🔜 Next | Schedule Silver + Gold runs |
+| 6 · Orchestration | ✅ Done | Airflow DAG + automation scripts |
 
 ---
 
@@ -131,20 +147,25 @@ docker exec lakehouse-spark-master /opt/spark/bin/spark-submit \
 
 ```
 realtime-lakehouse/
-├── docker-compose.yml          # Full local stack definition
+├── .env.example            # environment variable template (copy to .env)
+├── Makefile                # Linux/Mac one-command interface
+├── start.ps1               # Windows full startup script
+├── run_silver.ps1          # Windows Silver runner
+├── run_gold.ps1            # Windows Gold runner
+├── docker-compose.yml      # full local stack definition
 ├── postgres/
-│   ├── init.sql                # Source schema + Debezium user setup
-│   └── grants.sql              # Debezium permissions + publication
+│   ├── init.sql            # source schema + Debezium user setup
+│   └── grants.sql          # Debezium permissions + publication
 ├── debezium/
-│   └── register-connector.json # Debezium Postgres connector config
+│   └── register-connector.json
 ├── spark/
-│   ├── bronze_writer.py        # Streaming CDC → Iceberg Bronze
-│   ├── silver_writer.py        # Bronze → Silver MERGE upserts
-│   ├── gold_writer.py          # Silver → Gold aggregations
-│   └── ivy2/                   # Cached Spark/Ivy jars
-├── airflow/
-│   └── dags/                   # Pipeline orchestration DAGs (coming)
-└── great_expectations/         # Data quality checkpoints (coming)
+│   ├── bronze_writer.py    # Streaming CDC → Iceberg Bronze
+│   ├── silver_writer.py    # Bronze → Silver MERGE upserts
+│   ├── gold_writer.py      # Silver → Gold aggregations
+│   └── ivy2/               # cached Spark/Ivy jars (persists across restarts)
+└── airflow/
+    └── dags/
+        └── lakehouse_dag.py  # orchestrates Silver + Gold every 15 min
 ```
 
 ---
@@ -176,24 +197,11 @@ Every Kafka message from Debezium follows this envelope:
 
 ```json
 {
-  "op": "c",
-  "before": null,
-  "after": {
-    "id": 1,
-    "customer_id": 1,
-    "status": "pending",
-    "total_usd": "99.99",
-    "created_at": "2026-05-08T09:46:55.065808Z",
-    "updated_at": "2026-05-08T09:46:55.065808Z"
-  },
-  "source": {
-    "connector": "postgresql",
-    "db": "ecommerce",
-    "table": "orders",
-    "lsn": 29048488,
-    "ts_ms": 1776782951904
-  },
-  "ts_ms": 1776782952099
+  "op": "u",
+  "before": {"id":1, "status":"pending",   "total_usd":"99.99"},
+  "after":  {"id":1, "status":"completed", "total_usd":"99.99"},
+  "source": {"connector":"postgresql", "db":"ecommerce", "table":"orders", "lsn":29048488},
+  "ts_ms":  1776782952099
 }
 ```
 
@@ -248,7 +256,7 @@ Op types: `r` = snapshot, `c` = insert, `u` = update, `d` = delete
 ## Key Engineering Decisions
 
 **Why PySpark scripts instead of dbt?**
-The Spark Thrift Server required by `dbt-spark` is not included in the `apache/spark` Docker image and is complex to configure locally. Using PySpark scripts directly gives the same transformation power with full control over the MERGE logic, and is more transparent for understanding CDC semantics at the engine level.
+The Spark Thrift Server required by `dbt-spark` is not included in the `apache/spark` Docker image. Using PySpark scripts directly gives the same transformation power with full control over the MERGE logic, and is more transparent for understanding CDC semantics at the engine level.
 
 **Why Iceberg over Delta Lake?**
 Iceberg's open spec and catalog-agnostic design makes it easier to run locally without a managed metastore. It also has first-class support for `MERGE INTO` which is essential for CDC upsert patterns.
@@ -265,19 +273,16 @@ By default Debezium encodes `NUMERIC` columns as base64 binary. Setting `string`
 **Why soft deletes in Silver?**
 Hard-deleting rows in Silver would lose the information that a record was deleted. Soft deletes with `is_deleted=true` allow Gold aggregations to exclude deleted records while preserving the audit trail.
 
+**Why MERGE in Silver but overwrite in Gold?**
+Silver is a live table read by multiple consumers — overwriting it would cause downtime. MERGE updates only changed rows atomically. Gold is always fully recomputed from Silver so overwrite is safe, simpler, and faster.
+
 ---
 
 ## What's Next
 
-- [ ] Airflow DAG — orchestrate Silver + Gold runs every 15 minutes
 - [ ] Great Expectations — data quality checkpoints on Silver
 - [ ] Iceberg compaction + snapshot expiry maintenance tasks
 - [ ] Add `order_items` table to the pipeline
 - [ ] Trino query layer for ad-hoc SQL on Gold tables
 - [ ] OpenLineage for data lineage tracking
-
----
-
-## License
-
-MIT
+- [ ] Grafana dashboard for pipeline observability
