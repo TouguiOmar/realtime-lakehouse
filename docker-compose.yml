@@ -255,6 +255,7 @@ services:
       _AIRFLOW_WWW_USER_PASSWORD: admin
     volumes:
       - ./airflow/dags:/opt/airflow/dags
+      - /var/run/docker.sock:/var/run/docker.sock
     ports:
       - "8085:8080"                          # Airflow UI (mapped to 8085 — 8080 taken by Spark)
     command: standalone
